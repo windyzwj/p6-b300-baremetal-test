@@ -1,0 +1,123 @@
+# 复制为 terraform.tfvars 后填入实际值
+#
+# 4 种购买模式覆盖整个 B300 上线流程的不同阶段：
+#   场景 A：Spot 验证 Terraform 代码（最便宜，~$2/h）
+#   场景 B：On-Demand p5/g5 临时短测
+#   场景 C：ODCR（已有长期容量预留）
+#   场景 D：Capacity Block 正式跑 p6-b300（必填 cr-id）
+
+############################################################
+# 通用：所有场景都要填
+############################################################
+
+region        = "us-east-1"
+vpc_id        = "vpc-xxxxxxxxxxxxxxxxx"
+subnet_id     = "subnet-xxxxxxxxxxxxxxxxx"   # capacity_block / odcr 模式必须在锁定的 AZ
+key_name      = "my-keypair"
+bastion_sg_id = "sg-xxxxxxxxxxxxxxxxx"
+
+# AMI 选择
+#   "dlami" - AWS Deep Learning Base GPU AMI（推荐，纯硬件验证）
+#   "eks"   - EKS-optimized NVIDIA AMI 1.35（验证 EKS 节点组兼容性）
+ami_choice = "dlami"
+
+# 根盘大小（GB）
+root_volume_size = 300
+
+# user-data 是否安装 EFA userspace（libfabric / fi_info / aws-ofi-nccl）
+# EKS NVIDIA AMI 默认只装内核模块，必须开启
+# DLAMI 已自带，可以设 false 跳过
+install_efa_userspace = true
+efa_installer_version = ""             # 留空 = latest，或锁版本如 "1.48.0"
+
+############################################################
+# 网络访问方式（二选一）
+############################################################
+# 选项 1：堡垒机 + 私有 IP（客户生产环境用这个，默认）
+#   assign_public_ip = false
+#   subnet_id 可以是私有子网，仅堡垒机 SG 能 SSH
+#
+# 选项 2：直连 + 公网 IP（你自己测试用）
+#   assign_public_ip = true
+#   ssh_ingress_cidrs = ["你的公网IP/32"]   ← 必填，否则报错
+#   subnet_id 必须有 IGW 路由（公有子网）
+#   注意：auto-assigned public IP 重启会变（不是 EIP）
+
+assign_public_ip  = false
+ssh_ingress_cidrs = []
+# 例如自己测试：
+# assign_public_ip  = true
+# ssh_ingress_cidrs = ["1.2.3.4/32"]
+
+
+############################################################
+# 场景 A：Spot 验证（默认值）
+############################################################
+# Spot 任何实例类型都能开，包括 p6-b300（GPU spot 池稀缺，能拿到就赚到）。
+#
+# 推荐先用便宜的 g5.8xlarge 验证 TF 代码 / SG / ENI / user-data 跑通：
+#   purchase_mode = "spot"
+#   instance_type = "g5.8xlarge"
+#
+# 然后试 spot p6-b300（如果当前 AZ 有 spot 容量）：
+#   instance_type = "p6-b300.48xlarge"
+
+purchase_mode  = "spot"
+instance_type  = "g5.8xlarge"      # 改成 "p6-b300.48xlarge" 试 spot 拿 B300
+spot_max_price = ""                # 留空 = 按市价
+
+# spot 模式不用填 capacity_reservation_id
+capacity_reservation_id = ""
+
+
+############################################################
+# 场景 B：On-Demand 单机短测（取消下面注释，注释掉场景 A）
+############################################################
+# 标准按需，不绑定任何 reservation。
+# 适合：region 有空容量的 g5/p5 等
+# p6-b300 几乎肯定 InsufficientInstanceCapacity，建议走场景 D
+
+# purchase_mode  = "on_demand"
+# instance_type  = "p5.48xlarge"
+# capacity_reservation_id = ""
+# spot_max_price = ""
+
+
+############################################################
+# 场景 C：ODCR（On-Demand Capacity Reservation）
+############################################################
+# 适合：客户已有长期 cr-xxxxx，想用这个预留容量启动实例
+#
+# 创建 ODCR：
+#   aws ec2 create-capacity-reservation \
+#     --instance-type p6-b300.48xlarge \
+#     --instance-platform Linux/UNIX \
+#     --availability-zone us-east-1b \
+#     --instance-count 1 \
+#     --instance-match-criteria targeted
+
+# purchase_mode  = "odcr"
+# instance_type  = "p6-b300.48xlarge"      # 必须跟 ODCR 创建时的实例类型一致
+# capacity_reservation_id = "cr-xxxxxxxxxxxxxxxxx"
+# spot_max_price = ""
+#
+# ⚠️ subnet_id 必须在 ODCR 锁定的 AZ
+
+
+############################################################
+# 场景 D：Capacity Block for ML（正式跑 p6-b300）
+############################################################
+# 适合：通过 Capacity Block 提前预约 GPU 训练容量
+#
+# 购买 Capacity Block：
+#   控制台 EC2 → Capacity Reservations → Purchase Capacity Block
+#   选 instance type、duration、start date
+#   AWS 会返回一个 cr-xxxxx，跟 ODCR 同样格式但语义不同（有时间窗口）
+
+# purchase_mode  = "capacity_block"
+# instance_type  = "p6-b300.48xlarge"
+# capacity_reservation_id = "cr-xxxxxxxxxxxxxxxxx"
+# spot_max_price = ""
+#
+# ⚠️ subnet_id 必须在 Capacity Block 锁定的 AZ
+# ⚠️ 实例必须在 Capacity Block 时间窗口内启动，到期会被强制 terminate
