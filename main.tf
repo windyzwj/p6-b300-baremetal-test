@@ -144,6 +144,18 @@ variable "efa_installer_version" {
   default     = "1.48.0"
 }
 
+variable "existing_sg_id" {
+  description = "已有的 EFA Security Group ID。留空则新建。同 VPC 多台机器复用同一个 SG 时填这个。"
+  type        = string
+  default     = ""
+}
+
+variable "existing_instance_profile_name" {
+  description = "已有的 IAM Instance Profile 名。留空则新建。同账号多台机器复用同一个 Role 时填这个。"
+  type        = string
+  default     = ""
+}
+
 variable "name_prefix" {
   description = "资源名前缀"
   type        = string
@@ -243,10 +255,11 @@ locals {
 }
 
 ###############################################################################
-# Security Group（EFA self-referencing）
+# Security Group（条件创建：existing_sg_id 有值则复用，否则新建）
 ###############################################################################
 
 resource "aws_security_group" "efa" {
+  count       = var.existing_sg_id == "" ? 1 : 0
   name        = "${var.name_prefix}-efa-sg"
   description = "EFA-enabled SG for GPU bare metal test"
   vpc_id      = var.vpc_id
@@ -271,36 +284,42 @@ resource "aws_security_group" "efa" {
   }
 }
 
-# 额外放行公网 IP 段 SSH（手动挂 EIP 时用）
+# 额外放行公网 IP 段 SSH（仅新建 SG 时）
 resource "aws_security_group_rule" "ssh_from_public" {
-  count             = length(var.ssh_ingress_cidrs) > 0 ? 1 : 0
+  count             = var.existing_sg_id == "" && length(var.ssh_ingress_cidrs) > 0 ? 1 : 0
   type              = "ingress"
   from_port         = 22
   to_port           = 22
   protocol          = "tcp"
   cidr_blocks       = var.ssh_ingress_cidrs
-  security_group_id = aws_security_group.efa.id
+  security_group_id = aws_security_group.efa[0].id
   description       = "Extra SSH ingress for manually-attached EIP"
 }
 
-# CRITICAL：EFA 要求同 SG 内全协议互通
+# EFA self-referencing（仅新建 SG 时）
 resource "aws_security_group_rule" "efa_self_ingress" {
+  count             = var.existing_sg_id == "" ? 1 : 0
   type              = "ingress"
   from_port         = 0
   to_port           = 0
   protocol          = "-1"
   self              = true
-  security_group_id = aws_security_group.efa.id
+  security_group_id = aws_security_group.efa[0].id
   description       = "Required by EFA: allow all in-SG traffic"
 }
 
+locals {
+  # 统一入口：复用已有 SG 或用新建的
+  sg_id = var.existing_sg_id != "" ? var.existing_sg_id : aws_security_group.efa[0].id
+}
 
 ###############################################################################
-# IAM
+# IAM（条件创建：existing_instance_profile_name 有值则复用，否则新建）
 ###############################################################################
 
 resource "aws_iam_role" "instance" {
-  name = "${var.name_prefix}-role"
+  count = var.existing_instance_profile_name == "" ? 1 : 0
+  name  = "${var.name_prefix}-role"
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
@@ -312,13 +331,20 @@ resource "aws_iam_role" "instance" {
 }
 
 resource "aws_iam_role_policy_attachment" "ssm" {
-  role       = aws_iam_role.instance.name
+  count      = var.existing_instance_profile_name == "" ? 1 : 0
+  role       = aws_iam_role.instance[0].name
   policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
 resource "aws_iam_instance_profile" "instance" {
-  name = "${var.name_prefix}-profile"
-  role = aws_iam_role.instance.name
+  count = var.existing_instance_profile_name == "" ? 1 : 0
+  name  = "${var.name_prefix}-profile"
+  role  = aws_iam_role.instance[0].name
+}
+
+locals {
+  # 统一入口：复用已有 Instance Profile 或用新建的
+  instance_profile_name = var.existing_instance_profile_name != "" ? var.existing_instance_profile_name : aws_iam_instance_profile.instance[0].name
 }
 
 ###############################################################################
@@ -336,7 +362,7 @@ resource "aws_launch_template" "instance" {
   key_name      = var.key_name
 
   iam_instance_profile {
-    name = aws_iam_instance_profile.instance.name
+    name = local.instance_profile_name
   }
 
   # 17 个 / 33 个 / N 个网卡声明
@@ -349,7 +375,7 @@ resource "aws_launch_template" "instance" {
       network_card_index    = network_interfaces.value.network_card_index
       interface_type        = network_interfaces.value.interface_type
       subnet_id             = var.subnet_id
-      security_groups       = [aws_security_group.efa.id]
+      security_groups       = [local.sg_id]
       delete_on_termination = true
     }
   }
@@ -424,9 +450,6 @@ resource "aws_launch_template" "instance" {
 
   # on_demand 模式不设置 capacity_reservation_specification，AWS 默认 preference=open
 
-  depends_on = [
-    aws_security_group_rule.efa_self_ingress,
-  ]
 }
 
 ###############################################################################
