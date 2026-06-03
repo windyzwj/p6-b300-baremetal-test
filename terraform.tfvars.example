@@ -16,6 +16,11 @@ subnet_id     = "subnet-xxxxxxxxxxxxxxxxx"   # capacity_block / odcr 模式必�
 key_name      = "my-keypair"
 bastion_sg_id = "sg-xxxxxxxxxxxxxxxxx"
 
+# 复用已有资源（同 VPC 多台机器时填这两个，避免重复创建冲突）
+# 留空 = 新建；填值 = 复用已有的
+existing_sg_id                 = ""   # 第一台机器创建的 SG ID，例如 "sg-xxxxx"
+existing_instance_profile_name = ""   # 第一台机器创建的 Instance Profile，例如 "p6-b300-test-profile"
+
 # AMI 选择
 #   "dlami" - AWS Deep Learning Base GPU AMI（推荐，纯硬件验证）
 #   "eks"   - EKS-optimized NVIDIA AMI 1.35（验证 EKS 节点组兼容性）
@@ -31,23 +36,10 @@ install_efa_userspace = true
 efa_installer_version = ""             # 留空 = latest，或锁版本如 "1.48.0"
 
 ############################################################
-# 网络访问方式（二选一）
+# 网络访问
 ############################################################
-# 选项 1：堡垒机 + 私有 IP（客户生产环境用这个，默认）
-#   assign_public_ip = false
-#   subnet_id 可以是私有子网，仅堡垒机 SG 能 SSH
-#
-# 选项 2：直连 + 公网 IP（你自己测试用）
-#   assign_public_ip = true
-#   ssh_ingress_cidrs = ["你的公网IP/32"]   ← 必填，否则报错
-#   subnet_id 必须有 IGW 路由（公有子网）
-#   注意：auto-assigned public IP 重启会变（不是 EIP）
-
-assign_public_ip  = false
-ssh_ingress_cidrs = []
-# 例如自己测试：
-# assign_public_ip  = true
-# ssh_ingress_cidrs = ["1.2.3.4/32"]
+# 默认仅堡垒机 SG 能 SSH。如果需要从公网直连（手动挂 EIP 后）：
+ssh_ingress_cidrs = []    # 例如 ["1.2.3.4/32"] 放行你的公网 IP
 
 
 ############################################################
