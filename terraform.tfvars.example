@@ -22,9 +22,11 @@ existing_sg_id                 = ""   # 第一台机器创建的 SG ID，例如 
 existing_instance_profile_name = ""   # 第一台机器创建的 Instance Profile，例如 "p6-b300-test-profile"
 
 # AMI 选择
-#   "dlami" - AWS Deep Learning Base GPU AMI（推荐，纯硬件验证）
-#   "eks"   - EKS-optimized NVIDIA AMI 1.35（验证 EKS 节点组兼容性）
-ami_choice = "dlami"
+#   "dlami"  - AWS Deep Learning Base GPU AMI（推荐，纯硬件验证）
+#   "eks"    - EKS-optimized NVIDIA AMI 1.35（验证 EKS 节点组兼容性）
+#   "custom" - 客户自定义 AMI（必须填 custom_ami_id）
+ami_choice    = "dlami"
+custom_ami_id = ""           # 仅 ami_choice="custom" 时填，例如 "ami-0123456789abcdef0"
 
 # 根盘大小（GB）
 root_volume_size = 300

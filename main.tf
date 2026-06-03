@@ -78,13 +78,19 @@ variable "placement_group_name" {
 }
 
 variable "ami_choice" {
-  description = "AMI 选择：dlami（推荐）/ eks（验证 EKS 兼容性）"
+  description = "AMI 选择：dlami / eks / custom（自定义 AMI ID）"
   type        = string
   default     = "dlami"
   validation {
-    condition     = contains(["dlami", "eks"], var.ami_choice)
-    error_message = "ami_choice 必须是 dlami 或 eks"
+    condition     = contains(["dlami", "eks", "custom"], var.ami_choice)
+    error_message = "ami_choice 必须是 dlami、eks 或 custom"
   }
+}
+
+variable "custom_ami_id" {
+  description = "自定义 AMI ID（仅 ami_choice = custom 时生效）"
+  type        = string
+  default     = ""
 }
 
 variable "root_volume_size" {
@@ -229,7 +235,11 @@ check "reservation_id_required" {
 ###############################################################################
 
 locals {
-  ami_id = var.ami_choice == "dlami" ? data.aws_ami.dlami.id : nonsensitive(data.aws_ssm_parameter.eks_nvidia_ami.value)
+  ami_id = (
+    var.ami_choice == "custom" ? var.custom_ami_id :
+    var.ami_choice == "dlami" ? data.aws_ami.dlami.id :
+    nonsensitive(data.aws_ssm_parameter.eks_nvidia_ami.value)
+  )
 
   # EFA-only 网卡数
   efa_card_count_auto = (
