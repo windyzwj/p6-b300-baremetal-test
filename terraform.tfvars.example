@@ -37,6 +37,14 @@ root_volume_size = 300
 install_efa_userspace = true
 efa_installer_version = ""             # 留空 = latest，或锁版本如 "1.48.0"
 
+# 本地 Instance Store NVMe LVM
+# true = user-data 自动做 LVM stripe + 挂载（p6-b300 有 8×3.5TB）
+# false = 不做任何操作，开机后自己手动挂载
+enable_local_nvme_lvm  = true
+local_nvme_mount_path  = "/data"       # 挂载路径
+local_nvme_fs          = "xfs"         # xfs 或 ext4
+local_nvme_stripe_kb   = 256           # stripe size (KB)，256 适合大文件顺序读
+
 ############################################################
 # 网络访问
 ############################################################

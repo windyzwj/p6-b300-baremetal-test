@@ -150,6 +150,36 @@ variable "efa_installer_version" {
   default     = "1.48.0"
 }
 
+variable "enable_local_nvme_lvm" {
+  description = <<-EOT
+    是否在 user-data 里自动将本地 Instance Store NVMe 盘做 LVM stripe 并挂载。
+    - true:  自动检测所有 Instance Storage NVMe，LVM stripe 后挂载到 local_nvme_mount_path
+    - false: 不做任何操作，客户开机后自己手动挂载
+    p6-b300 有 8 × 3.5TB 本地 NVMe，适合放模型缓存。
+    注意：Instance Store 是临时存储，实例停止/终止后数据丢失。
+  EOT
+  type        = bool
+  default     = true
+}
+
+variable "local_nvme_mount_path" {
+  description = "本地 NVMe LVM 挂载路径"
+  type        = string
+  default     = "/data"
+}
+
+variable "local_nvme_fs" {
+  description = "本地 NVMe 文件系统类型：xfs 或 ext4"
+  type        = string
+  default     = "xfs"
+}
+
+variable "local_nvme_stripe_kb" {
+  description = "LVM stripe size（KB）。256 适合大文件顺序读（模型加载）"
+  type        = number
+  default     = 256
+}
+
 variable "existing_sg_id" {
   description = "已有的 EFA Security Group ID。留空则新建。同 VPC 多台机器复用同一个 SG 时填这个。"
   type        = string
@@ -552,6 +582,118 @@ locals {
   efa_installer_snippet = var.install_efa_userspace ? local._efa_install_block : "echo 'EFA userspace install skipped (install_efa_userspace=false)'"
 
   # ===========================================================================
+  # 公共片段：本地 Instance Store NVMe LVM stripe + 挂载
+  # 参考 aws-samples/sample-eks-enterprise-quickstart 的写法：
+  #   - 扫描 /sys/block/nvme*n1，通过 device/model 过滤 "Instance Storage"
+  #   - 多盘 LVM stripe（p6-b300 有 8 × 3.5TB）
+  #   - systemd service 保证重启后自动挂载
+  #   - 幂等：已挂载则跳过
+  # ===========================================================================
+  _nvme_lvm_block = <<-NVME_LVM
+    # ============================================================
+    # Local Instance Store NVMe LVM Setup
+    # ============================================================
+    echo "=== Setting up Local Instance Store NVMe LVM ==="
+    command -v lvcreate >/dev/null || dnf install -y lvm2
+
+    install -m 0755 /dev/stdin /usr/local/sbin/setup-local-lvm.sh <<'SETUP_LOCAL_LVM'
+    #!/bin/bash
+    set -e
+    VG_NAME="vg_local"
+    LV_NAME="lv_data"
+    MOUNT_POINT="${var.local_nvme_mount_path}"
+    FS_TYPE="${var.local_nvme_fs}"
+    STRIPE_KB="${var.local_nvme_stripe_kb}"
+
+    log() { echo "[local-lvm] $*"; }
+
+    # 检测 Instance Storage NVMe 盘（排除 EBS）
+    LOCAL_DISKS=()
+    for sys_path in /sys/block/nvme*n1; do
+      [ -e "$sys_path" ] || continue
+      model=$(cat "$sys_path/device/model" 2>/dev/null | xargs)
+      case "$model" in
+        *"Instance Storage"*) LOCAL_DISKS+=("/dev/$(basename "$sys_path")") ;;
+      esac
+    done
+
+    if [ $${#LOCAL_DISKS[@]} -eq 0 ]; then
+      log "No Instance Store NVMe disks detected; skipping"
+      exit 0
+    fi
+
+    log "Detected $${#LOCAL_DISKS[@]} local NVMe disk(s): $${LOCAL_DISKS[*]}"
+    mkdir -p "$MOUNT_POINT"
+
+    # 幂等：已挂载则跳过
+    if mountpoint -q "$MOUNT_POINT"; then
+      log "$MOUNT_POINT already mounted"
+      exit 0
+    fi
+
+    # VG 已存在则直接激活挂载
+    if vgs "$VG_NAME" >/dev/null 2>&1; then
+      log "VG $VG_NAME already exists, activating and mounting"
+      vgchange -ay "$VG_NAME"
+      mount -o noatime,nodiratime,discard "/dev/$VG_NAME/$LV_NAME" "$MOUNT_POINT"
+      exit 0
+    fi
+
+    # 新建 LVM
+    log "Building $VG_NAME across $${#LOCAL_DISKS[@]} disk(s)"
+    for d in "$${LOCAL_DISKS[@]}"; do
+      wipefs -a "$d" || true
+      pvcreate -ff -y "$d"
+    done
+
+    vgcreate "$VG_NAME" "$${LOCAL_DISKS[@]}"
+
+    if [ $${#LOCAL_DISKS[@]} -gt 1 ]; then
+      lvcreate -y -i "$${#LOCAL_DISKS[@]}" -I "$STRIPE_KB" -l 100%FREE -n "$LV_NAME" "$VG_NAME"
+    else
+      lvcreate -y -l 100%FREE -n "$LV_NAME" "$VG_NAME"
+    fi
+
+    case "$FS_TYPE" in
+      xfs)  mkfs.xfs -f "/dev/$VG_NAME/$LV_NAME" ;;
+      ext4) mkfs.ext4 -F "/dev/$VG_NAME/$LV_NAME" ;;
+      *)    log "Unsupported FS: $FS_TYPE"; exit 1 ;;
+    esac
+
+    mount -o noatime,nodiratime,discard "/dev/$VG_NAME/$LV_NAME" "$MOUNT_POINT"
+    chmod 1777 "$MOUNT_POINT"
+    log "Mounted /dev/$VG_NAME/$LV_NAME at $MOUNT_POINT ($FS_TYPE)"
+    df -h "$MOUNT_POINT"
+    SETUP_LOCAL_LVM
+
+    # systemd service 保证重启自动挂载
+    cat > /etc/systemd/system/setup-local-lvm.service <<'UNIT'
+    [Unit]
+    Description=Initialize and mount local NVMe Instance Store LVM
+    DefaultDependencies=no
+    After=local-fs-pre.target systemd-udev-settle.service
+    Before=local-fs.target kubelet.service containerd.service docker.service
+    Wants=systemd-udev-settle.service
+
+    [Service]
+    Type=oneshot
+    ExecStart=/usr/local/sbin/setup-local-lvm.sh
+    RemainAfterExit=yes
+    StandardOutput=journal+console
+    StandardError=journal+console
+
+    [Install]
+    WantedBy=local-fs.target
+    UNIT
+
+    systemctl daemon-reload
+    systemctl enable --now setup-local-lvm.service
+    echo "=== Local NVMe LVM Setup Complete ==="
+  NVME_LVM
+
+  nvme_lvm_snippet = var.enable_local_nvme_lvm ? local._nvme_lvm_block : "echo 'Local NVMe LVM skipped (enable_local_nvme_lvm=false)'"
+
+  # ===========================================================================
   # 公共片段：验证脚本（落到 /root/validate-b300.sh）
   # ===========================================================================
   validate_snippet = <<-VALIDATE
@@ -625,6 +767,8 @@ locals {
 
     ${local.efa_installer_snippet}
 
+    ${local.nvme_lvm_snippet}
+
     ${local.validate_snippet}
 
     echo "=== bringup done $(date) ==="
@@ -652,6 +796,8 @@ locals {
     %{endif}
 
     ${local.efa_installer_snippet}
+
+    ${local.nvme_lvm_snippet}
 
     ${local.validate_snippet}
 
